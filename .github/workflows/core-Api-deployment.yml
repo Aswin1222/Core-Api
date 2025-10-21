@@ -3,10 +3,8 @@ name: core-Api-deployment
 on:
   push:
     branches:
-      - dev2
-      - qa
-      - demo
-      - prod
+      
+      - feature/core-api
 
 jobs:
   # ──────────────── DEV2 ────────────────
