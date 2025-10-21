@@ -1,0 +1,185 @@
+name: core-Api-deployment
+
+on:
+  push:
+    branches:
+      - dev2
+      - qa
+      - demo
+      - prod
+
+jobs:
+  # ──────────────── DEV2 ────────────────
+  build_and_deploy_dev2:
+    if: github.ref == 'refs/heads/dev2'
+    name: Build and Deploy Dev2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: dev2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint azure-storage-blob requests
+
+      - name: Set TIMESTAMP
+        run: echo "TIMESTAMP=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_ENV
+
+      - name: Run pylint and save report
+        run: |
+          if [ -d "coreapi" ] || [ -d "utils" ]; then
+            pylint coreapi/ utils/ --output-format=text > coreapi-${{ env.TIMESTAMP }}.txt || true
+          else
+            echo "No directories found for linting."
+          fi
+
+      - name: Upload Pylint Report to Dev Blob
+        run: |
+          if [ -f "coreapi-${{ env.TIMESTAMP }}.txt" ]; then
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name pylint-reports \
+              --name dev/coreapi-${{ env.TIMESTAMP }}.txt \
+              --file coreapi-${{ env.TIMESTAMP }}.txt \
+              --auth-mode key
+          else
+            echo "No pylint report to upload."
+          fi
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+
+      - name: Docker Login to Dev ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ndradev.azurecr.io
+          username: ${{ secrets.REGISTRY_USERNAME_DEV2 }}
+          password: ${{ secrets.REGISTRY_PASSWORD_DEV2 }}
+
+      - name: Build and Push Dev Docker Image
+        run: |
+          docker build -t ndradev.azurecr.io/ndra-core-api:latest .
+          docker push ndradev.azurecr.io/ndra-core-api:latest
+
+  # ──────────────── QA / DEMO / PROD ────────────────
+  build_and_deploy_env:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/demo' || github.ref == 'refs/heads/prod')
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME_QA: ndraqa.azurecr.io/ndra-core-api
+      IMAGE_NAME_DEMO: ndrademo.azurecr.io/ndra-core-api
+      IMAGE_NAME_PROD: ndraprod.azurecr.io/ndra-core-api
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Branch
+        id: determine_branch
+        run: echo "BRANCH=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
+
+      - name: Check if config file was modified
+        id: check_config_changes
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          if echo "$CHANGED_FILES" | grep -q "$CONFIG_FILE"; then
+            echo "modified=true" >> $GITHUB_OUTPUT
+          else
+            echo "modified=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check config file existence
+        id: check_config
+        if: steps.check_config_changes.outputs.modified == 'true'
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          if [ -f "$CONFIG_FILE" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read version from config.json
+        id: get_version
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          CONFIG_FILE="config/${{ steps.determine_branch.outputs.BRANCH }}.json"
+          VERSION=$(python -c "import json; print(json.load(open('$CONFIG_FILE'))['version'].strip())")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: tag_check
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          if git rev-parse "refs/tags/${{ env.VERSION }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create tag if not exists
+        if: steps.tag_check.outputs.exists == 'false' && steps.check_config.outputs.exists == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag ${{ env.VERSION }}
+          git push origin ${{ env.VERSION }}
+
+      - name: Set environment variables
+        id: set_env
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          if [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "qa" ]]; then
+            echo "REGISTRY=ndraqa.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_QA }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_QA }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_QA }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "demo" ]]; then
+            echo "REGISTRY=ndrademo.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_DEMO }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_DEMO }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_DEMO }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ steps.determine_branch.outputs.BRANCH }}" == "prod" ]]; then
+            echo "REGISTRY=ndraprod.azurecr.io" >> $GITHUB_OUTPUT
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME_PROD }}" >> $GITHUB_OUTPUT
+            echo "USERNAME=${{ secrets.REGISTRY_USERNAME_PROD }}" >> $GITHUB_OUTPUT
+            echo "PASSWORD=${{ secrets.REGISTRY_PASSWORD_PROD }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker Login to ACR
+        if: steps.check_config.outputs.exists == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.set_env.outputs.REGISTRY }}
+          username: ${{ steps.set_env.outputs.USERNAME }}
+          password: ${{ steps.set_env.outputs.PASSWORD }}
+
+      - name: Build and Push Docker Image with Version Tag
+        if: steps.check_config.outputs.exists == 'true'
+        run: |
+          IMAGE=${{ steps.set_env.outputs.IMAGE_NAME }}
+          VERSION=${{ env.VERSION }}
+          docker build -t $IMAGE:$VERSION .
+          docker push $IMAGE:$VERSION
+          echo "Pushed image: $IMAGE:$VERSION"
